@@ -195,7 +195,11 @@
           wakeLock = null;
         });
       } catch (err) {
-        statusEl.textContent = 'wake lock: unavailable';
+        const reason = err && err.name ? ` (${err.name})` : '';
+        const hint = err && err.name === 'NotAllowedError'
+          ? ' — interact with the page (click/tap) and try again.'
+          : '';
+        statusEl.textContent = 'wake lock: unavailable' + reason + hint;
       }
     }
 
