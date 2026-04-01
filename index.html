@@ -164,7 +164,7 @@
     let startTime = null;
 
     function animate(timestamp) {
-      if (!startTime) startTime = timestamp;
+      if (startTime === null) startTime = timestamp;
       const t = (timestamp - startTime) * 0.001; // elapsed seconds
 
       drawPlasma(t);
