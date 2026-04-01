@@ -191,8 +191,15 @@
         statusEl.textContent = 'wake lock: active';
 
         wakeLock.addEventListener('release', () => {
-          statusEl.textContent = 'wake lock: released';
           wakeLock = null;
+          // Re-acquire if the page is still visible (the release may be
+          // triggered by OS power/battery policies, not just tab hiding).
+          if (document.visibilityState === 'visible') {
+            statusEl.textContent = 'wake lock: retrying…';
+            setTimeout(requestWakeLock, 2000);
+          } else {
+            statusEl.textContent = 'wake lock: released';
+          }
         });
       } catch (err) {
         const reason = err && err.name ? ` (${err.name})` : '';
