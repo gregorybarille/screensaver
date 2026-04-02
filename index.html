@@ -101,11 +101,13 @@
 
           // Normalise to [0, 1]
           v = (v / 5 + 1) * 0.5;
+          // Power curve: pushes most pixels toward black, only peaks stay bright
+          v = v * v * v;
 
-          // Hue cycles continuously; saturation and lightness stay vivid
+          // Hue cycles continuously; high saturation and wide lightness range
           const hue = (v + t * 0.06) % 1;
-          const s   = 0.90;
-          const l   = 0.30 + v * 0.25;
+          const s   = 0.95;
+          const l   = v * 0.60;
 
           const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
           const p = 2 * l - q;
@@ -159,9 +161,64 @@
 
     const sparkles = Array.from({ length: SPARKLE_COUNT }, () => new Sparkle());
 
+    // ── Dark blob layer ───────────────────────────────────────────────────────
+    // Large slowly-drifting black ellipses that cut dark voids through the
+    // plasma, dramatically increasing the proportion of black pixels on screen.
+
+    const BLOB_COUNT = 18;
+
+    class DarkBlob {
+      constructor() { this.reset(true); }
+
+      reset(initial = false) {
+        this.x    = Math.random() * canvas.width;
+        this.y    = Math.random() * canvas.height;
+        this.rx   = 80  + Math.random() * 220;
+        this.ry   = 60  + Math.random() * 180;
+        this.vx   = (Math.random() - 0.5) * 0.4;
+        this.vy   = (Math.random() - 0.5) * 0.3;
+        this.rot  = Math.random() * Math.PI * 2;
+        this.vrot = (Math.random() - 0.5) * 0.002;
+        // Stagger phases so blobs don't all pulse together
+        this.phase = initial ? Math.random() * Math.PI * 2 : 0;
+        this.alpha = 0.55 + Math.random() * 0.35;
+      }
+
+      update() {
+        this.x   += this.vx;
+        this.y   += this.vy;
+        this.rot += this.vrot;
+        this.phase += 0.005;
+        // Wrap around edges with a margin so blobs glide smoothly on/off screen
+        const mx = this.rx + 50;
+        const my = this.ry + 50;
+        if (this.x < -mx)                this.x = canvas.width  + mx;
+        if (this.x > canvas.width  + mx) this.x = -mx;
+        if (this.y < -my)                this.y = canvas.height + my;
+        if (this.y > canvas.height + my) this.y = -my;
+      }
+
+      draw() {
+        // Gently breathe the opacity
+        const a = this.alpha * (0.75 + 0.25 * Math.sin(this.phase));
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rot);
+        ctx.scale(1, this.rx > 0 ? this.ry / this.rx : 1);
+        ctx.beginPath();
+        ctx.arc(0, 0, this.rx, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0,0,0,${a})`;
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    const blobs = Array.from({ length: BLOB_COUNT }, () => new DarkBlob());
+
     // ── Animation loop ────────────────────────────────────────────────────────
 
     let startTime = null;
+    let rafId     = null; // tracks the pending requestAnimationFrame handle
 
     function animate(timestamp) {
       if (startTime === null) startTime = timestamp;
@@ -169,15 +226,31 @@
 
       drawPlasma(t);
 
+      // Dark blobs painted directly over plasma (source-over with black fill)
+      blobs.forEach(b => { b.update(); b.draw(); });
+
       // Draw sparkles with 'screen' blend so they glow on top of the plasma
       ctx.globalCompositeOperation = 'screen';
       sparkles.forEach(s => { s.update(); s.draw(); });
       ctx.globalCompositeOperation = 'source-over';
 
-      requestAnimationFrame(animate);
+      rafId = requestAnimationFrame(animate);
     }
 
-    requestAnimationFrame(animate);
+    function startAnimation() {
+      if (rafId !== null) return; // already running, don't spawn a second loop
+      startTime = null;           // recalibrate time so there's no jump on resume
+      rafId = requestAnimationFrame(animate);
+    }
+
+    function stopAnimation() {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    }
+
+    startAnimation();
 
     // ── Screen Wake Lock API ──────────────────────────────────────────────────
     // Uses the native Screen Wake Lock API to prevent the device from sleeping.
@@ -215,11 +288,13 @@
       }
     }
 
-    // Re-acquire the lock whenever the page becomes visible again
-    // (browsers automatically release it when the tab is hidden).
+    // Pause/resume the loop and the wake lock as the tab is hidden/shown.
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
+        startAnimation();
         requestWakeLock();
+      } else {
+        stopAnimation();
       }
     });
 
