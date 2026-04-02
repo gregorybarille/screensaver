@@ -218,12 +218,9 @@
     // ── Animation loop ────────────────────────────────────────────────────────
 
     let startTime = null;
+    let rafId     = null; // tracks the pending requestAnimationFrame handle
 
     function animate(timestamp) {
-      // Stop the loop entirely when the tab is not visible to save power.
-      // The visibilitychange handler will restart it when the tab is foregrounded.
-      if (document.hidden) return;
-
       if (startTime === null) startTime = timestamp;
       const t = (timestamp - startTime) * 0.001; // elapsed seconds
 
@@ -237,10 +234,23 @@
       sparkles.forEach(s => { s.update(); s.draw(); });
       ctx.globalCompositeOperation = 'source-over';
 
-      requestAnimationFrame(animate);
+      rafId = requestAnimationFrame(animate);
     }
 
-    requestAnimationFrame(animate);
+    function startAnimation() {
+      if (rafId !== null) return; // already running, don't spawn a second loop
+      startTime = null;           // recalibrate time so there's no jump on resume
+      rafId = requestAnimationFrame(animate);
+    }
+
+    function stopAnimation() {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    }
+
+    startAnimation();
 
     // ── Screen Wake Lock API ──────────────────────────────────────────────────
     // Uses the native Screen Wake Lock API to prevent the device from sleeping.
@@ -278,14 +288,13 @@
       }
     }
 
-    // Re-acquire the lock whenever the page becomes visible again
-    // (browsers automatically release it when the tab is hidden).
+    // Pause/resume the loop and the wake lock as the tab is hidden/shown.
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
-        // Recalibrate so elapsed time doesn't jump by however long the tab was hidden.
-        startTime = null;
-        requestAnimationFrame(animate);
+        startAnimation();
         requestWakeLock();
+      } else {
+        stopAnimation();
       }
     });
 
