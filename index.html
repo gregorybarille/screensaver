@@ -220,6 +220,10 @@
     let startTime = null;
 
     function animate(timestamp) {
+      // Stop the loop entirely when the tab is not visible to save power.
+      // The visibilitychange handler will restart it when the tab is foregrounded.
+      if (document.hidden) return;
+
       if (startTime === null) startTime = timestamp;
       const t = (timestamp - startTime) * 0.001; // elapsed seconds
 
@@ -278,6 +282,9 @@
     // (browsers automatically release it when the tab is hidden).
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
+        // Recalibrate so elapsed time doesn't jump by however long the tab was hidden.
+        startTime = null;
+        requestAnimationFrame(animate);
         requestWakeLock();
       }
     });
