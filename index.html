@@ -47,6 +47,9 @@
     const plasma = document.createElement('canvas');
     const pCtx   = plasma.getContext('2d');
     let pData;           // ImageData reused every frame
+    let pixels;          // pData's bytes seen as one 32-bit RGBA value per pixel
+    let rippleDist;      // distance of each plasma pixel from the centre, ×13
+    let colA, colCs, colCc, colEs, colEc; // per-column wave values, refilled every frame
 
     // Render plasma at 1/SCALE resolution then scale up for performance.
     // Scale 6 gives a beautifully soft look while staying fast on any device.
@@ -55,11 +58,27 @@
     function resize() {
       canvas.width  = window.innerWidth;
       canvas.height = window.innerHeight;
-      plasma.width  = Math.ceil(canvas.width  / PLASMA_SCALE);
-      plasma.height = Math.ceil(canvas.height / PLASMA_SCALE);
-      pData = pCtx.createImageData(plasma.width, plasma.height);
+      // Changing the canvas size resets the context, so smoothing is set here
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+
+      const w = plasma.width  = Math.max(1, Math.ceil(canvas.width  / PLASMA_SCALE));
+      const h = plasma.height = Math.max(1, Math.ceil(canvas.height / PLASMA_SCALE));
+      pData  = pCtx.createImageData(w, h);
+      pixels = new Uint32Array(pData.data.buffer);
+
+      rippleDist = new Float32Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          rippleDist[y * w + x] = Math.hypot(x / w - 0.5, y / h - 0.5) * 13;
+        }
+      }
+      [colA, colCs, colCc, colEs, colEc] = Array.from({ length: 5 }, () => new Float64Array(w));
     }
-    window.addEventListener('resize', resize);
+    window.addEventListener('resize', () => {
+      resize();
+      sparkles.forEach(s => s.reset(true)); // spread them over the new size
+    });
     resize();
 
     // ── Plasma wave engine ────────────────────────────────────────────────────
@@ -77,61 +96,97 @@
       return p;
     }
 
+    // Colour depends only on brightness and time, so it is worked out once per
+    // frame into a lookup table instead of an HSL conversion for every pixel.
+    const LUT_SIZE = 1024;
+    const lut = new Uint32Array(LUT_SIZE);
+
+    function buildPalette(t) {
+      // The base hue swings teal (0.5) → violet → red (1.0) and back every ~5 min.
+      // It never sits on yellow or orange, which turn olive and brown when dim.
+      const base = 0.75 + 0.25 * Math.sin(t * 0.02);
+      const s    = 0.95;
+
+      for (let k = 0; k < LUT_SIZE; k++) {
+        const v   = k / (LUT_SIZE - 1);
+        const hue = (base + v * 0.2) % 1; // bright peaks lean a little warmer
+        const l   = v * 0.60;
+        const q   = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p   = 2 * l - q;
+        const r   = hue2rgb(p, q, hue + 1 / 3) * 255 | 0;
+        const g   = hue2rgb(p, q, hue)         * 255 | 0;
+        const b   = hue2rgb(p, q, hue - 1 / 3) * 255 | 0;
+        // shortcut: packs RGBA for little-endian byte order (every current browser device)
+        lut[k] = 0xff000000 | (b << 16) | (g << 8) | r;
+      }
+    }
+
     function drawPlasma(t) {
-      const w   = plasma.width;
-      const h   = plasma.height;
-      const buf = pData.data;
+      const w = plasma.width;
+      const h = plasma.height;
+      buildPalette(t);
 
+      // Only the ripple depends on x and y together. The other waves are split
+      // into column and row parts with sin(a + b) = sin a·cos b + cos a·sin b,
+      // so the inner loop does one Math.sin per pixel instead of five.
+      for (let x = 0; x < w; x++) {
+        const fx = x / w;
+        colA[x]  = Math.sin(fx * 9 + t * 0.80);
+        colCs[x] = Math.sin(fx * 8 + t);
+        colCc[x] = Math.cos(fx * 8 + t);
+        colEs[x] = Math.sin(fx * 5 + t * 0.65);
+        colEc[x] = Math.cos(fx * 5 + t * 0.65);
+      }
+
+      let i = 0;
       for (let y = 0; y < h; y++) {
-        const fy = y / h;
-        for (let x = 0; x < w; x++) {
-          const fx  = x / w;
-          const idx = (y * w + x) * 4;
+        const fy  = y / h;
+        const rB  = Math.sin(fy * 7 + t * 0.55);
+        const rC8 = Math.cos(fy * 8), rS8 = Math.sin(fy * 8);
+        const rC4 = Math.cos(fy * 4), rS4 = Math.sin(fy * 4);
 
-          const cx   = fx - 0.5;
-          const cy   = fy - 0.5;
-          const dist = Math.sqrt(cx * cx + cy * cy);
-
+        for (let x = 0; x < w; x++, i++) {
           // v ∈ [-5, 5]
-          let v = Math.sin(fx * 9         + t * 0.80)
-                + Math.sin(fy * 7         + t * 0.55)
-                + Math.sin((fx + fy) * 8  + t * 1.00)
-                + Math.sin(dist * 13      - t * 1.20)
-                + Math.sin(fx * 5 - fy * 4 + t * 0.65);
+          let v = colA[x]                                // sin(fx * 9 + 0.80t)
+                + rB                                     // sin(fy * 7 + 0.55t)
+                + colCs[x] * rC8 + colCc[x] * rS8        // sin((fx + fy) * 8 + t)
+                + Math.sin(rippleDist[i] - t * 1.20)     // sin(dist * 13 - 1.20t)
+                + colEs[x] * rC4 - colEc[x] * rS4;       // sin(fx * 5 - fy * 4 + 0.65t)
 
           // Normalise to [0, 1]
           v = (v / 5 + 1) * 0.5;
           // Power curve: pushes most pixels toward black, only peaks stay bright
           v = v * v * v;
 
-          // Hue cycles continuously; high saturation and wide lightness range
-          const hue = (v + t * 0.06) % 1;
-          const s   = 0.95;
-          const l   = v * 0.60;
-
-          const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-          const p = 2 * l - q;
-
-          buf[idx]     = hue2rgb(p, q, hue + 1 / 3) * 255 | 0;
-          buf[idx + 1] = hue2rgb(p, q, hue)         * 255 | 0;
-          buf[idx + 2] = hue2rgb(p, q, hue - 1 / 3) * 255 | 0;
-          buf[idx + 3] = 255;
+          pixels[i] = lut[v * (LUT_SIZE - 1) | 0];
         }
       }
 
       pCtx.putImageData(pData, 0, 0);
 
       // Scale the small plasma buffer up to the full canvas with smoothing
-      ctx.imageSmoothingEnabled  = true;
-      ctx.imageSmoothingQuality  = 'high';
       ctx.drawImage(plasma, 0, 0, canvas.width, canvas.height);
     }
 
     // ── Sparkle layer ─────────────────────────────────────────────────────────
-    // Bright white specks that appear and fade out give the impression of stars
-    // twinkling through the plasma waves.
+    // Soft warm glints that drift slowly upward, fade in and fade out, like
+    // embers or stars glimpsed through the plasma.
 
-    const SPARKLE_COUNT = 70;
+    const SPARKLE_COUNT = 60;
+
+    // One soft glow, drawn once and stamped for every sparkle
+    const glow = document.createElement('canvas');
+    glow.width = glow.height = 32;
+    {
+      const g    = glow.getContext('2d');
+      const grad = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+      grad.addColorStop(0,    'rgba(255, 255, 255, 1)');
+      grad.addColorStop(0.15, 'rgba(255, 248, 235, 0.9)');
+      grad.addColorStop(0.4,  'rgba(255, 230, 200, 0.25)');
+      grad.addColorStop(1,    'rgba(255, 230, 200, 0)');
+      g.fillStyle = grad;
+      g.fillRect(0, 0, 32, 32);
+    }
 
     class Sparkle {
       constructor() { this.reset(true); }
@@ -142,20 +197,21 @@
         this.life  = initial ? Math.random() : 0;
         this.maxL  = 0.5 + Math.random() * 0.5;
         this.speed = 0.003 + Math.random() * 0.007;
-        this.size  = 0.8 + Math.random() * 2.2;
+        this.size  = 3 + Math.random() * 7;          // glow radius in px
+        this.vx    = (Math.random() - 0.5) * 8;      // px per second
+        this.vy    = -(2 + Math.random() * 6);
       }
 
-      update() {
-        this.life += this.speed;
+      update(dt) {
+        this.life += this.speed * dt * 60; // speed is per frame at 60 fps
+        this.x    += this.vx * dt;
+        this.y    += this.vy * dt;
         if (this.life >= this.maxL) this.reset();
       }
 
       draw() {
-        const alpha = Math.sin((this.life / this.maxL) * Math.PI);
-        ctx.beginPath();
-        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(255,255,255,${alpha * 0.85})`;
-        ctx.fill();
+        ctx.globalAlpha = Math.sin((this.life / this.maxL) * Math.PI) * 0.85;
+        ctx.drawImage(glow, this.x - this.size, this.y - this.size, this.size * 2, this.size * 2);
       }
     }
 
@@ -165,17 +221,17 @@
 
     let startTime = null;
     let rafId     = null; // tracks the pending requestAnimationFrame handle
+    let prevT     = 0;
 
     function animate(timestamp) {
       if (startTime === null) startTime = timestamp;
-      const t = (timestamp - startTime) * 0.001; // elapsed seconds
+      const t  = (timestamp - startTime) * 0.001; // elapsed seconds
+      const dt = Math.max(0, t - prevT);          // t restarts at 0 on resume
+      prevT = t;
 
       drawPlasma(t);
-
-      // Draw sparkles with 'screen' blend so they glow on top of the plasma
-      ctx.globalCompositeOperation = 'screen';
-      sparkles.forEach(s => { s.update(); s.draw(); });
-      ctx.globalCompositeOperation = 'source-over';
+      sparkles.forEach(s => { s.update(dt); s.draw(); });
+      ctx.globalAlpha = 1; // the plasma must be drawn fully opaque next frame
 
       rafId = requestAnimationFrame(animate);
     }
@@ -201,35 +257,44 @@
 
     const statusEl = document.getElementById('status');
     let wakeLock   = null;
+    let statusTimer;
+
+    // Clear the status after a few seconds: static text would burn into OLED pixels
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+      clearTimeout(statusTimer);
+      statusTimer = setTimeout(() => { statusEl.textContent = ''; }, 5000);
+    }
 
     async function requestWakeLock() {
       if (!('wakeLock' in navigator)) {
-        statusEl.textContent = 'wake lock: not supported';
+        setStatus('wake lock: not supported');
         return;
       }
       try {
         wakeLock = await navigator.wakeLock.request('screen');
-        statusEl.textContent = 'wake lock: active';
+        setStatus('wake lock: active');
 
         wakeLock.addEventListener('release', () => {
           wakeLock = null;
           // Re-acquire if the page is still visible (the release may be
           // triggered by OS power/battery policies, not just tab hiding).
           if (document.visibilityState === 'visible') {
-            statusEl.textContent = 'wake lock: retrying…';
+            setStatus('wake lock: retrying…');
             setTimeout(requestWakeLock, 2000);
           } else {
-            statusEl.textContent = 'wake lock: released';
+            setStatus('wake lock: released');
           }
         });
       } catch (err) {
         const reason = err && err.name ? ` (${err.name})` : '';
-        const hint = err && err.name === 'NotAllowedError'
-          ? ' — interact with the page (click/tap) and try again.'
-          : '';
-        statusEl.textContent = 'wake lock: unavailable' + reason + hint;
+        const hint = err && err.name === 'NotAllowedError' ? ' — click to retry' : '';
+        setStatus('wake lock: unavailable' + reason + hint);
       }
     }
+
+    // The NotAllowedError hint asks for a click, so a click retries
+    document.addEventListener('click', () => { if (!wakeLock) requestWakeLock(); });
 
     // Pause/resume the loop and the wake lock as the tab is hidden/shown.
     document.addEventListener('visibilitychange', () => {
